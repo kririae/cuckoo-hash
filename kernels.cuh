@@ -14,9 +14,9 @@ template <typename T>
 static void print_device_vector(T* vec, int num_elements,
                                 const std::string& name = "") {
   auto ptr = thrust::device_pointer_cast(vec);
-  fmt::print("{}: ", name);
+  fmt::print("[{}] [size={}] [gpu]: [", name, num_elements);
   for (int i = 0; i < num_elements; ++i) fmt::print("{} ", ptr[i]);
-  fmt::print("\n");
+  fmt::print("]\n");
 }
 
 namespace experiments {
@@ -67,8 +67,7 @@ __device__ __constant__ HashTableParams params;
 namespace detail {
 __device__ static int hash_bucket(int k) {
   LOCALIZE_CONSTANT_PARAMS
-
-  return k % num_buckets;
+  return abs((19260817 + 16383 * k) % 1900813) % num_buckets;
 }
 
 /**
@@ -82,6 +81,7 @@ __global__ void distribute_buckets_kernel01() {
     const int bucket_index = hash_bucket(i);
     const int prev_count   = atomicAdd(&count[bucket_index], 1);
     offset[i]              = prev_count;
+    assert(offset[i] <= 512);
   }
 }
 
@@ -110,6 +110,7 @@ __global__ void cuckoo_hash_iteration() {
 
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   for (; i < num_buckets; i += blockDim.x * gridDim.x) {
+    const int* bucket_start = bucket_buffer + start[i];
   }
 }
 }  // namespace detail
@@ -140,6 +141,8 @@ class HashTable {
     bucket_buffer = static_cast<int*>(
         thrust::malloc(thrust::device_system_tag{}, sizeof(int) * num_pairs * 2)
             .get());
+
+    thrust::fill(thrust::device_system_tag{}, count, count + num_buckets, 0);
 
     // setup constant memory
     setup_params();
