@@ -5,7 +5,7 @@
 using namespace experiments;
 
 int main() {
-  auto kvset = MakeKeyValueSet(4096 * 128);
+  auto kvset = MakeKeyValueSet(8);
   fmt::print("{}\n", kvset.num_pairs);
 
   auto hash = HashTable(kvset);
