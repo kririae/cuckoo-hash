@@ -3,17 +3,21 @@
 
 #define FMT_HEADER_ONLY
 #include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <fmt/core.h>
 #include <thrust/device_vector.h>
 #include <thrust/functional.h>
 #include <thrust/host_vector.h>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <cub/cub.cuh>
+#include <random>
+
 using namespace thrust::placeholders;
 namespace cg = cooperative_groups;
 
 template <typename T>
-static void print_device_vector(T* vec, int num_elements,
+inline void print_device_vector(T* vec, int num_elements,
                                 const std::string& name = "") {
   auto ptr = thrust::device_pointer_cast(vec);
   fmt::print("[{}] [size={}] [gpu]: [", name, num_elements);
@@ -25,6 +29,8 @@ namespace experiments {
 struct KeyValueSet {
   int*        kvpairs; /* interleaved [[key, value] [key, value]] */
   std::size_t num_pairs;
+
+  ~KeyValueSet() { thrust::free(thrust::device_system_tag{}, kvpairs); }
 };
 
 KeyValueSet MakeKeyValueSet(std::size_t num_keys) {
@@ -34,10 +40,18 @@ KeyValueSet MakeKeyValueSet(std::size_t num_keys) {
   return KeyValueSet{.kvpairs   = thrust::raw_pointer_cast(kvpairs.get()),
                      .num_pairs = num_keys};
 }
+
+KeyValueSet MakeQueryKeyValueSet(std::size_t num_keys) {
+  auto result = MakeKeyValueSet(num_keys);
+  thrust::transform(
+      thrust::device_system_tag{}, result.kvpairs,
+      result.kvpairs + 2 * result.num_pairs, result.kvpairs,
+      [] __host__ __device__(int val) { return val % 2 == 0 ? 0 : val; });
+  return result;
+}
 }  // namespace experiments
 
 /// HASH TABLE
-constexpr int NUM_SUBTABLES = 2;
 struct HashTableParams {
   std::size_t num_buckets;
   std::size_t num_pairs;
@@ -48,6 +62,8 @@ struct HashTableParams {
   int* offset;
   int* bucket_buffer; /* num_pairs * 2 */
   int* hash_table;    /* the result */
+
+  int *c0, *c1; /* num_buckets * 3 */
 };
 
 __device__ __constant__ HashTableParams params;
@@ -61,6 +77,8 @@ __device__ __constant__ HashTableParams params;
   [[maybe_unused]] int*              offset        = params.offset;        \
   [[maybe_unused]] int*              bucket_buffer = params.bucket_buffer; \
   [[maybe_unused]] int*              hash_table    = params.hash_table;    \
+  [[maybe_unused]] int*              c0            = params.c0;            \
+  [[maybe_unused]] int*              c1            = params.c1;            \
   (void)num_buckets;                                                       \
   (void)num_pairs;                                                         \
   (void)kvpairs;                                                           \
@@ -68,17 +86,21 @@ __device__ __constant__ HashTableParams params;
   (void)start;                                                             \
   (void)offset;                                                            \
   (void)bucket_buffer;                                                     \
-  (void)hash_table;
+  (void)hash_table;                                                        \
+  (void)c0;                                                                \
+  (void)c1;
 
 namespace detail {
 __device__ int hash_bucket(int k) {
   LOCALIZE_CONSTANT_PARAMS
-  return k % num_buckets;
+  uint64_t _k = static_cast<uint64_t>(k);
+  return (114514 + 19260817 * _k) % num_buckets;
 }
 
+template <int SUBTABLE_SIZE>
 __device__ int hash_cuckoo(int k, int c0, int c1) {
   uint64_t _k = static_cast<uint64_t>(k);
-  return ((c0 + c1 * _k) % 1900813) % 512;
+  return ((c0 + c1 * _k) % 1900813) % SUBTABLE_SIZE;
 }
 
 __device__ unsigned long long pack_key_value(int key, int value) {
@@ -93,7 +115,8 @@ __global__ void distribute_buckets_kernel01() {
 
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   for (; i < num_pairs; i += blockDim.x * gridDim.x) {
-    const int bucket_index = hash_bucket(i);
+    const int key          = kvpairs[2 * i];
+    const int bucket_index = hash_bucket(key);
     const int prev_count   = atomicAdd(&count[bucket_index], 1);
     offset[i]              = prev_count;
     assert(offset[i] <= 512);
@@ -108,9 +131,9 @@ __global__ void distribute_buckets_kernel02() {
 
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   for (; i < num_pairs; i += blockDim.x * gridDim.x) {
-    const int bucket_index = hash_bucket(i);
     const int key          = kvpairs[2 * i];
     const int value        = kvpairs[2 * i + 1];
+    const int bucket_index = hash_bucket(key);
 
     const int start_index    = start[bucket_index];
     const int offset_index   = offset[i];
@@ -120,6 +143,7 @@ __global__ void distribute_buckets_kernel02() {
   }
 }
 
+template <int NUM_SUBTABLES, int SUBTABLE_SIZE>
 __global__ void cuckoo_hash_iteration() {
   LOCALIZE_CONSTANT_PARAMS
 
@@ -128,20 +152,13 @@ __global__ void cuckoo_hash_iteration() {
   const int thread_rank = g.thread_rank();
   const int block_index = g.group_index().x;
 
-  const int      MAX_ITER = 20;
-  constexpr int  c0[]     = {560653, 827269, 317011};
-  constexpr int  c1[]     = {969809, 756703, 955469};
-  __shared__ int bucket[NUM_SUBTABLES][512 * 2 /* interleave */];
+  const int      MAX_ITER = 25;
+  __shared__ int bucket[NUM_SUBTABLES][SUBTABLE_SIZE * 2 /* interleave */];
 
-  // initialize shared memory
-#pragma unroll
-  for (int k = 0; k < NUM_SUBTABLES; ++k) {
-    bucket[k][thread_rank << 1]       = 0;
-    bucket[k][(thread_rank << 1) + 1] = 0;
-  }
-
-  // barrier
-  g.sync();
+  // block vote
+  using BlockReduce = cub::BlockReduce<int, 512>;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  __shared__ int                               block_vote;
 
   const int  bucket_index = block_index;
   const int  bucket_size  = count[bucket_index];
@@ -151,53 +168,127 @@ __global__ void cuckoo_hash_iteration() {
   const int  value        = valid_op ? bucket_buffer[i + 1] : -1;
   assert(thread_rank < 512);
 
-  /// cuckoo iteration
-  for (int it = 0; it < MAX_ITER; ++it) {
-    const int subtable_index =
-        (it % NUM_SUBTABLES);  // the subtable we're currently working on
+  // if (g.thread_rank() == 0) printf("%d\n", bucket_size);
+  // if (block_index == 2 && valid_op) printf("key: %d\n", key);
 
-    // Check if this key is already in the bucket
-    bool exists_in_hashtable = false;
-    if (valid_op)  // disable lane
+  while (true) {
+    // initialize shared memory
 #pragma unroll
-      for (int k = 0; k < NUM_SUBTABLES; ++k) {
-        const int g = hash_cuckoo(key, c0[k], c1[k]);
-        exists_in_hashtable |= (bucket[k][g << 1] == key);
+    for (int k = 0; k < NUM_SUBTABLES; ++k) {
+      if (thread_rank < SUBTABLE_SIZE) {
+        bucket[k][thread_rank << 1]       = 0;
+        bucket[k][(thread_rank << 1) + 1] = 0;
       }
-
-    // to makesure that all `read` operations are done
-    g.sync();
-
-    // branch
-    if (!exists_in_hashtable && valid_op) {
-      const int g = hash_cuckoo(key, c0[subtable_index], c1[subtable_index]);
-      // write key-value pair
-#if __CUDA_ARCH__ >= 600
-      atomicExch_block(reinterpret_cast<unsigned long long*>(
-                           &bucket[subtable_index][g << 1]),
-                       pack_key_value(key, value));
-#else
-      atomicExch(reinterpret_cast<unsigned long long*>(
-                     &bucket[subtable_index][g << 1]),
-                 pack_key_value(key, value));
-#endif
     }
 
-    // write i into the bucket
+    // barrier
     g.sync();
+
+    /// cuckoo iteration
+    int it;
+    for (it = 0; it < MAX_ITER; ++it) {
+      const int subtable_index =
+          (it % NUM_SUBTABLES);  // the subtable we're currently working on
+
+      // Check if this key is already in the bucket
+      bool exists_in_hashtable = false;
+      if (valid_op)  // disable lane
+#pragma unroll
+        for (int k = 0; k < NUM_SUBTABLES; ++k) {
+          const int c_index = NUM_SUBTABLES * bucket_index + k;
+          const int g =
+              hash_cuckoo<SUBTABLE_SIZE>(key, c0[c_index], c1[c_index]);
+          exists_in_hashtable |= (bucket[k][g << 1] == key);
+        }
+
+      // to makesure that all `read` operations are done
+      g.sync();
+
+      // Collect the number of unfinished operations
+      const int num_nonfinished =
+          BlockReduce(temp_storage)
+              .Reduce((!exists_in_hashtable && valid_op) ? 1 : 0, cub::Sum());
+      if (g.thread_rank() == 0) block_vote = num_nonfinished;
+      g.sync();
+      if (block_vote == 0) break;
+
+      // branch
+      if (!exists_in_hashtable && valid_op) {
+        const int c_index = NUM_SUBTABLES * bucket_index + subtable_index;
+        const int g = hash_cuckoo<SUBTABLE_SIZE>(key, c0[c_index], c1[c_index]);
+
+        // write key-value pair
+#if __CUDA_ARCH__ >= 600
+        atomicExch_block(reinterpret_cast<unsigned long long*>(
+                             &bucket[subtable_index][g << 1]),
+                         pack_key_value(key, value));
+#else
+        atomicExch(reinterpret_cast<unsigned long long*>(
+                       &bucket[subtable_index][g << 1]),
+                   pack_key_value(key, value));
+#endif
+      }
+
+      // write i into the bucket
+      g.sync();
+    }
+
+    if (block_vote == 0) break;
+    if (g.thread_rank() == 0) {
+#if 0
+      printf("[%d] [%d] error block_vote %d\n", block_index, thread_rank,
+             block_vote);
+#endif
+      // modify the random numbers
+      for (int k = 0; k < NUM_SUBTABLES; ++k) {
+        const int c_index = NUM_SUBTABLES * bucket_index + k;
+        c0[c_index]++;
+        c1[c_index]++;
+      }
+    }
   }
 
   // write local buckets to global hash_table
-  int* hash_table_start = hash_table + (NUM_SUBTABLES * 512 * 2) * bucket_index;
+  int* hash_table_start =
+      hash_table + (NUM_SUBTABLES * SUBTABLE_SIZE * 2) * bucket_index;
   for (int k = 0; k < NUM_SUBTABLES; ++k) {
-    hash_table_start += (512 * 2) * k;
-    hash_table_start[thread_rank << 1] = bucket[k][thread_rank << 1];
-    hash_table_start[(thread_rank << 1) + 1] =
-        bucket[k][(thread_rank << 1) + 1];
+    int* local_hash_table_start = hash_table_start + (SUBTABLE_SIZE * 2) * k;
+
+    if (thread_rank < SUBTABLE_SIZE) {
+      local_hash_table_start[thread_rank << 1] = bucket[k][thread_rank << 1];
+      local_hash_table_start[(thread_rank << 1) + 1] =
+          bucket[k][(thread_rank << 1) + 1];
+    }
+  }
+}
+
+template <int NUM_SUBTABLES, int SUBTABLE_SIZE>
+__global__ void query_hashtable(int*        query_kvpairs,
+                                std::size_t query_num_pairs) {
+  LOCALIZE_CONSTANT_PARAMS
+
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  for (; i < query_num_pairs; i += blockDim.x * gridDim.x) {
+    const int key          = query_kvpairs[i << 1];
+    const int bucket_index = hash_bucket(key);
+    int*      hash_table_start =
+        hash_table + (NUM_SUBTABLES * SUBTABLE_SIZE * 2) * bucket_index;
+
+    for (int k = 0; k < NUM_SUBTABLES; ++k) {
+      const int c_index = NUM_SUBTABLES * bucket_index + k;
+      const int g = hash_cuckoo<SUBTABLE_SIZE>(key, c0[c_index], c1[c_index]);
+
+      int* local_hash_table_start = hash_table_start + (SUBTABLE_SIZE * 2) * k;
+      if (local_hash_table_start[g << 1] == key) {
+        query_kvpairs[(i << 1) + 1] = local_hash_table_start[(g << 1) + 1];
+        break;
+      }
+    }
   }
 }
 }  // namespace detail
 
+template <int NUM_SUBTABLES = 2, int SUBTABLE_SIZE = 576 / NUM_SUBTABLES>
 class HashTable {
  public:
   /**
@@ -224,21 +315,32 @@ class HashTable {
     bucket_buffer = static_cast<int*>(
         thrust::malloc(thrust::device_system_tag{}, sizeof(int) * num_pairs * 2)
             .get());
-
-    const std::size_t hash_table_num_elements =
-        num_buckets * NUM_SUBTABLES * 512 * 2;
-    const std::size_t hash_table_size = hash_table_num_elements * sizeof(int);
-    hash_table                        = static_cast<int*>(
+    hash_table_num_elements = num_buckets * NUM_SUBTABLES * SUBTABLE_SIZE * 2;
+    hash_table_size         = hash_table_num_elements * sizeof(int);
+    hash_table              = static_cast<int*>(
         thrust::malloc(thrust::device_system_tag{}, hash_table_size).get());
-    thrust::fill(thrust::device_system_tag{}, count, count + num_buckets, 0);
-    thrust::fill(thrust::device_system_tag{}, hash_table,
-                 hash_table + hash_table_num_elements, 0);
 
-    // setup constant memory
-    setup_params();
+    c0 = static_cast<int*>(thrust::malloc(thrust::device_system_tag{},
+                                          sizeof(int) * num_buckets * 3)
+                               .get());
+    c1 = static_cast<int*>(thrust::malloc(thrust::device_system_tag{},
+                                          sizeof(int) * num_buckets * 3)
+                               .get());
 
-    phase1();
-    phase2();
+    // random generator on CPU
+    std::random_device rd;
+    std::mt19937       rng(rd());
+    rng.seed(0);
+    std::uniform_int_distribution<int> uniform(1e4, 1e8);
+    std::vector<int>                   host_vec(num_buckets * 3);
+    std::generate(host_vec.begin(), host_vec.end(), std::bind(uniform, rng));
+    cudaMemcpy(c0, host_vec.data(), sizeof(int) * num_buckets * 3,
+               cudaMemcpyHostToDevice);
+    std::generate(host_vec.begin(), host_vec.end(), std::bind(uniform, rng));
+    cudaMemcpy(c1, host_vec.data(), sizeof(int) * num_buckets * 3,
+               cudaMemcpyHostToDevice);
+
+    build();
   }
 
   ~HashTable() {
@@ -247,17 +349,56 @@ class HashTable {
     thrust::free(thrust::device_system_tag{}, offset);
     thrust::free(thrust::device_system_tag{}, bucket_buffer);
     thrust::free(thrust::device_system_tag{}, hash_table);
+    thrust::free(thrust::device_system_tag{}, c0);
+    thrust::free(thrust::device_system_tag{}, c1);
+  }
+
+  void build() {
+    // initialize all to zero
+    reset();
+
+    // setup constant memory
+    setup_params();
+
+    // main execution
+    float       time;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    phase1();
+    phase2();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+    fmt::print("build time: {:.3f} ms", time);
+  }
+
+  void reset() {
+    thrust::fill(thrust::device_system_tag{}, count, count + num_buckets, 0);
+    thrust::fill(thrust::device_system_tag{}, hash_table,
+                 hash_table + hash_table_num_elements, 0);
+  }
+
+  void query(const experiments::KeyValueSet& kvset) {
+    constexpr int THREADS_PER_BLOCK = 512;
+    const int     NUM_BLOCKS =
+        (kvset.num_pairs + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    detail::query_hashtable<NUM_SUBTABLES, SUBTABLE_SIZE>
+        <<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(kvset.kvpairs, kvset.num_pairs);
   }
 
  private:
   /// Basic info
   std::size_t num_buckets, num_pairs;
+  std::size_t hash_table_num_elements, hash_table_size;
   int*        kvpairs /* num_pairs */;
   int*        count /* num_buckets */;
   int*        start; /* num_buckets */
   int*        offset /* num_pairs */;
   int*        bucket_buffer /* num_pairs * 2 */;
   int*        hash_table /* num_buckets * num_subtables * 512 * 2 */;
+  int *       c0, *c1; /* num_buckets * 3 */
 
   /// Cuckoo hashing info
 
@@ -269,7 +410,9 @@ class HashTable {
                                        .start         = start,
                                        .offset        = offset,
                                        .bucket_buffer = bucket_buffer,
-                                       .hash_table    = hash_table};
+                                       .hash_table    = hash_table,
+                                       .c0            = c0,
+                                       .c1            = c1};
     cudaMemcpyToSymbol(params, &host_params, sizeof(HashTableParams));
   }
 
@@ -296,6 +439,7 @@ class HashTable {
     detail::distribute_buckets_kernel02<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>();
 
     cudaDeviceSynchronize();
+
 #if 0
     print_device_vector(start, num_buckets, "start");
     print_device_vector(count, num_buckets, "count");
@@ -308,7 +452,8 @@ class HashTable {
    * @brief Cuckoo hashing phase
    */
   void phase2() {
-    detail::cuckoo_hash_iteration<<<num_buckets, 512>>>();
+    detail::cuckoo_hash_iteration<NUM_SUBTABLES, SUBTABLE_SIZE>
+        <<<num_buckets, 512>>>();
     cudaDeviceSynchronize();
 
 #if 0
