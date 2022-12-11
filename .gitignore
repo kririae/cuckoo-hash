@@ -1,4 +1,5 @@
 .cache/
 nsight/
 hash
+tests
 compile_commands.json

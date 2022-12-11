@@ -5,13 +5,10 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <fmt/core.h>
-#include <thrust/device_vector.h>
-#include <thrust/functional.h>
-#include <thrust/host_vector.h>
-#include <thrust/iterator/transform_iterator.h>
 
 #include <cub/cub.cuh>
-#include <random>
+
+#include "gen.cuh"
 
 using namespace thrust::placeholders;
 namespace cg = cooperative_groups;
@@ -24,32 +21,6 @@ inline void print_device_vector(T* vec, int num_elements,
   for (int i = 0; i < num_elements; ++i) fmt::print("{} ", ptr[i]);
   fmt::print("]\n");
 }
-
-namespace experiments {
-struct KeyValueSet {
-  int*        kvpairs; /* interleaved [[key, value] [key, value]] */
-  std::size_t num_pairs;
-
-  ~KeyValueSet() { thrust::free(thrust::device_system_tag{}, kvpairs); }
-};
-
-KeyValueSet MakeKeyValueSet(std::size_t num_keys) {
-  auto kvpairs = thrust::malloc<int>(thrust::device_system_tag{}, 2 * num_keys);
-  thrust::fill(kvpairs, kvpairs + 2 * num_keys, 1);
-  thrust::inclusive_scan(kvpairs, kvpairs + 2 * num_keys, kvpairs);
-  return KeyValueSet{.kvpairs   = thrust::raw_pointer_cast(kvpairs.get()),
-                     .num_pairs = num_keys};
-}
-
-KeyValueSet MakeQueryKeyValueSet(std::size_t num_keys) {
-  auto result = MakeKeyValueSet(num_keys);
-  thrust::transform(
-      thrust::device_system_tag{}, result.kvpairs,
-      result.kvpairs + 2 * result.num_pairs, result.kvpairs,
-      [] __host__ __device__(int val) { return val % 2 == 0 ? 0 : val; });
-  return result;
-}
-}  // namespace experiments
 
 /// HASH TABLE
 struct HashTableParams {
@@ -92,14 +63,14 @@ __device__ __constant__ HashTableParams params;
 
 namespace detail {
 __device__ int hash_bucket(int k) {
-  LOCALIZE_CONSTANT_PARAMS
-  uint64_t _k = static_cast<uint64_t>(k);
+  const std::size_t num_buckets = params.num_buckets;
+  uint64_t          _k          = static_cast<uint64_t>(k);
   return (114514 + 19260817 * _k) % num_buckets;
 }
 
 template <int SUBTABLE_SIZE>
 __device__ int hash_cuckoo(int k, int c0, int c1) {
-  uint64_t _k = static_cast<uint64_t>(k);
+  uint32_t _k = static_cast<uint32_t>(k);
   return ((c0 + c1 * _k) % 1900813) % SUBTABLE_SIZE;
 }
 
@@ -152,7 +123,7 @@ __global__ void cuckoo_hash_iteration() {
   const int thread_rank = g.thread_rank();
   const int block_index = g.group_index().x;
 
-  const int      MAX_ITER = 16;
+  const int      MAX_ITER = 2 * log2f(num_pairs);
   __shared__ int bucket[NUM_SUBTABLES][SUBTABLE_SIZE * 2 /* interleave */];
 
   // block vote
@@ -168,8 +139,12 @@ __global__ void cuckoo_hash_iteration() {
   const int  value        = valid_op ? bucket_buffer[i + 1] : -1;
   assert(thread_rank < 512);
 
-  int chain_length = 0;
+  int restart_times = 0;
+  int chain_length  = 0;
+
   while (true) {
+    chain_length = 0;
+
     // initialize shared memory
 #pragma unroll
     for (int k = 0; k < NUM_SUBTABLES; ++k) {
@@ -231,7 +206,8 @@ __global__ void cuckoo_hash_iteration() {
       g.sync();
     }
 
-    ++chain_length;
+    chain_length = it;
+
     if (block_vote == 0) break;
     if (g.thread_rank() == 0) {
 #if 0
@@ -248,6 +224,7 @@ __global__ void cuckoo_hash_iteration() {
     }
 
     g.sync();
+    ++restart_times;
   }
 
   // const int max_chain_length =
@@ -295,7 +272,18 @@ __global__ void query_hashtable(int*        query_kvpairs,
 }
 }  // namespace detail
 
-template <int NUM_SUBTABLES = 2, int SUBTABLE_SIZE = 576 / NUM_SUBTABLES>
+/**
+ * @brief The GPU hash table class
+ * @note To specify the size of the hash table, num_buckets * NUM_SUBTABLES *
+ * SUBTABLE_SIZE, which can be calculated approximately by
+ *
+ * @tparam NUM_SUBTABLES number of hash functions
+ * @tparam SUBTABLE_SIZE the size of subtables
+ * @tparam BUCKET_RATIO the ratio used to calculate num_buckets
+ */
+template <int NUM_SUBTABLES = 2,                    //
+          int SUBTABLE_SIZE = 576 / NUM_SUBTABLES,  //
+          int BUCKET_RATIO  = 409>                   //
 class HashTable {
  public:
   /**
@@ -305,7 +293,7 @@ class HashTable {
    */
   HashTable(const experiments::KeyValueSet& kvset) {
     num_buckets = static_cast<std::size_t>(
-        std::ceil(static_cast<double>(kvset.num_pairs) / 409));
+        std::ceil(static_cast<double>(kvset.num_pairs) / BUCKET_RATIO));
     num_pairs = kvset.num_pairs;
     kvpairs   = kvset.kvpairs;
 
@@ -406,7 +394,7 @@ class HashTable {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time, start, stop);
 
-    fmt::print("query_time", time);
+    fmt::print("query_time: {:.3f}\n", time);
     fmt::print("query_MOPs: {:.3f}\n", kvset.num_pairs / (time / 1000.0) / 1e6);
   }
 
