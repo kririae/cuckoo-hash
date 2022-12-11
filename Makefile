@@ -1,5 +1,5 @@
 export NVCC := $(shell which nvcc)
-CUDAFLAGS = --std=c++17 -I./ -O0 -g --expt-extended-lambda
+CUDAFLAGS = --std=c++17 -I./ -O3 -g -Xptxas -O3,-v --expt-extended-lambda -lineinfo --gpu-architecture=sm_61
 
 all: hash
 hash: main.cu kernels.cuh

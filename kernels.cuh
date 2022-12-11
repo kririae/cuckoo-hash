@@ -152,7 +152,7 @@ __global__ void cuckoo_hash_iteration() {
   const int thread_rank = g.thread_rank();
   const int block_index = g.group_index().x;
 
-  const int      MAX_ITER = 25;
+  const int      MAX_ITER = 16;
   __shared__ int bucket[NUM_SUBTABLES][SUBTABLE_SIZE * 2 /* interleave */];
 
   // block vote
@@ -168,9 +168,7 @@ __global__ void cuckoo_hash_iteration() {
   const int  value        = valid_op ? bucket_buffer[i + 1] : -1;
   assert(thread_rank < 512);
 
-  // if (g.thread_rank() == 0) printf("%d\n", bucket_size);
-  // if (block_index == 2 && valid_op) printf("key: %d\n", key);
-
+  int chain_length = 0;
   while (true) {
     // initialize shared memory
 #pragma unroll
@@ -233,20 +231,29 @@ __global__ void cuckoo_hash_iteration() {
       g.sync();
     }
 
+    ++chain_length;
     if (block_vote == 0) break;
     if (g.thread_rank() == 0) {
 #if 0
       printf("[%d] [%d] error block_vote %d\n", block_index, thread_rank,
              block_vote);
 #endif
-      // modify the random numbers
+// modify the random numbers
+#pragma unroll
       for (int k = 0; k < NUM_SUBTABLES; ++k) {
         const int c_index = NUM_SUBTABLES * bucket_index + k;
         c0[c_index]++;
         c1[c_index]++;
       }
     }
+
+    g.sync();
   }
+
+  // const int max_chain_length =
+  //     BlockReduce(temp_storage).Reduce(chain_length, cub::Max());
+  // if (g.thread_rank() == 0) printf("max_chain_length: %d\n",
+  // max_chain_length);
 
   // write local buckets to global hash_table
   int* hash_table_start =
@@ -320,24 +327,26 @@ class HashTable {
     hash_table              = static_cast<int*>(
         thrust::malloc(thrust::device_system_tag{}, hash_table_size).get());
 
-    c0 = static_cast<int*>(thrust::malloc(thrust::device_system_tag{},
-                                          sizeof(int) * num_buckets * 3)
-                               .get());
-    c1 = static_cast<int*>(thrust::malloc(thrust::device_system_tag{},
-                                          sizeof(int) * num_buckets * 3)
-                               .get());
+    c0 = static_cast<int*>(
+        thrust::malloc(thrust::device_system_tag{},
+                       sizeof(int) * num_buckets * NUM_SUBTABLES)
+            .get());
+    c1 = static_cast<int*>(
+        thrust::malloc(thrust::device_system_tag{},
+                       sizeof(int) * num_buckets * NUM_SUBTABLES)
+            .get());
 
     // random generator on CPU
     std::random_device rd;
     std::mt19937       rng(rd());
-    rng.seed(0);
+    // rng.seed();
     std::uniform_int_distribution<int> uniform(1e4, 1e8);
-    std::vector<int>                   host_vec(num_buckets * 3);
+    std::vector<int>                   host_vec(num_buckets * NUM_SUBTABLES);
     std::generate(host_vec.begin(), host_vec.end(), std::bind(uniform, rng));
-    cudaMemcpy(c0, host_vec.data(), sizeof(int) * num_buckets * 3,
+    cudaMemcpy(c0, host_vec.data(), sizeof(int) * num_buckets * NUM_SUBTABLES,
                cudaMemcpyHostToDevice);
     std::generate(host_vec.begin(), host_vec.end(), std::bind(uniform, rng));
-    cudaMemcpy(c1, host_vec.data(), sizeof(int) * num_buckets * 3,
+    cudaMemcpy(c1, host_vec.data(), sizeof(int) * num_buckets * NUM_SUBTABLES,
                cudaMemcpyHostToDevice);
 
     build();
@@ -371,7 +380,8 @@ class HashTable {
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time, start, stop);
-    fmt::print("build time: {:.3f} ms", time);
+    fmt::print("build_time: {:.3f}\n", time);
+    fmt::print("build_MOPs: {:.3f}\n", num_pairs / (time / 1000.0) / 1e6);
   }
 
   void reset() {
@@ -384,8 +394,20 @@ class HashTable {
     constexpr int THREADS_PER_BLOCK = 512;
     const int     NUM_BLOCKS =
         (kvset.num_pairs + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    float       time;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
     detail::query_hashtable<NUM_SUBTABLES, SUBTABLE_SIZE>
         <<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(kvset.kvpairs, kvset.num_pairs);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+
+    fmt::print("query_time", time);
+    fmt::print("query_MOPs: {:.3f}\n", kvset.num_pairs / (time / 1000.0) / 1e6);
   }
 
  private:

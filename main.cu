@@ -7,7 +7,7 @@ using namespace experiments;
 int main() {
   constexpr int num_keys = 1 << 24;
   auto          kvset    = MakeKeyValueSet(num_keys);
-  fmt::print("num_pairs {}\n", kvset.num_pairs);
+  fmt::print("num_pairs: {}\n", kvset.num_pairs);
 
   auto hash = HashTable<3>(kvset);
 
@@ -20,7 +20,6 @@ int main() {
   for (int i = 0; i < hv.size(); ++i) {
     if (hv[i] != i + 1) {
       fmt::print("{} {}\n", i, hv[i]);
-      break;
     }
   }
 }
