@@ -1,0 +1,9 @@
+Cuckoo Hash
+===========
+
+This repository is some code and experiments on Cuckoo Hash, specifically,
+It is an implementation for *Real-Time Parallel Hashing on the GPU*. 
+NVIDIA's CUB and Thrust are used for optimization.
+
+To use this repo, run `make all`. Two executable files will be produced, 
+`hash` and `tests`. You can collect data and validate correctness using them.
