@@ -15,7 +15,7 @@ int main() {
   // auto          ref      = MakeRefCPUMap(kvset);
   fmt::print("num_pairs: {}\n", kvset.num_pairs);
 
-  auto hash = HashTable<3>(kvset);
+  auto hash = HashTable<2>(kvset);
 
   auto query_kvset = MakeQueryKeyValueSet(num_keys);
   // auto query_kvset = MakeQueryKeyValueSetProportion(kvset, 0.2);

@@ -114,7 +114,7 @@ __global__ void distribute_buckets_kernel02() {
   }
 }
 
-template <int NUM_SUBTABLES, int SUBTABLE_SIZE>
+template <int NUM_SUBTABLES, int SUBTABLE_SIZE, int MAX_ITER>
 __global__ void cuckoo_hash_iteration() {
   LOCALIZE_CONSTANT_PARAMS
 
@@ -123,7 +123,6 @@ __global__ void cuckoo_hash_iteration() {
   const int thread_rank = g.thread_rank();
   const int block_index = g.group_index().x;
 
-  const int      MAX_ITER = 2 * log2f(num_pairs);
   __shared__ int bucket[NUM_SUBTABLES][SUBTABLE_SIZE * 2 /* interleave */];
 
   // block vote
@@ -283,7 +282,8 @@ __global__ void query_hashtable(int*        query_kvpairs,
  */
 template <int NUM_SUBTABLES = 2,                    //
           int SUBTABLE_SIZE = 576 / NUM_SUBTABLES,  //
-          int BUCKET_RATIO  = 409>                   //
+          int BUCKET_RATIO  = 409,                  //
+          int MAX_ITER      = 25>                        //
 class HashTable {
  public:
   /**
@@ -462,7 +462,7 @@ class HashTable {
    * @brief Cuckoo hashing phase
    */
   void phase2() {
-    detail::cuckoo_hash_iteration<NUM_SUBTABLES, SUBTABLE_SIZE>
+    detail::cuckoo_hash_iteration<NUM_SUBTABLES, SUBTABLE_SIZE, MAX_ITER>
         <<<num_buckets, 512>>>();
     cudaDeviceSynchronize();
 
