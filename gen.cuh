@@ -8,7 +8,9 @@
 #include <thrust/random.h>
 #include <thrust/shuffle.h>
 
+#if 0
 #include <boost/container/flat_map.hpp>
+#endif
 #include <cstddef>
 #include <random>
 
@@ -91,6 +93,7 @@ KeyValueSet MakeQueryKeyValueSetProportion(const KeyValueSet& kvset,
   return result;
 }
 
+#if 0
 boost::container::flat_map<int, int> MakeRefCPUMap(const KeyValueSet& kvset) {
   boost::container::flat_map<int, int> result;
   auto                     dpc = thrust::device_pointer_cast(kvset.kvpairs);
@@ -98,6 +101,7 @@ boost::container::flat_map<int, int> MakeRefCPUMap(const KeyValueSet& kvset) {
   for (int i = 0; i < hv.size(); i += 2) result[hv[i]] = hv[i + 1];
   return result;
 }
+#endif
 }  // namespace experiments
 
 #endif
