@@ -50,7 +50,7 @@ class TestCases {
     }
 
     fmt::print("succeed: {}\n", execute);
-    fmt::print(">>> test_insertion_table_size\n");
+    fmt::print("<<< test_insertion_table_size\n");
   }
 
   template <int MAX_ITER>
@@ -66,7 +66,7 @@ class TestCases {
         HashTable<NUM_HASH_FUNCTIONS, 576 / NUM_HASH_FUNCTIONS, 409, MAX_ITER>(
             kvset);
 
-    fmt::print(">>> test_max_iter\n");
+    fmt::print("<<< test_max_iter\n");
   }
 
   void execute() {
