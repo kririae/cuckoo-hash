@@ -1,5 +1,6 @@
 .cache/
 nsight/
+report/fig/
 hash
 tests
 compile_commands.json

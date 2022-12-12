@@ -74,7 +74,7 @@ class TestCases {
     for (int s = 10; s <= 24; ++s) test_insertion(s);
 
     // Test 2
-    for (int i = 0; i < 10; ++i) test_lookup(i);
+    for (int i = 0; i <= 10; ++i) test_lookup(i);
 
     // Test 3
     test_insertion_table_size<static_cast<int>(1.1 * 409)>(false);
